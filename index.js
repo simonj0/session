@@ -78,6 +78,10 @@ var defer = typeof setImmediate === 'function'
  * @param {Boolean} [options.rolling] Enable/disable rolling session expiration
  * @param {Boolean} [options.saveUninitialized] Save uninitialized sessions to the store
  * @param {String|Array} [options.secret] Secret for signing session ID
+ * @param {Object} [options.sessionId]
+ * @param {Function} [options.sessionId.generate] Session ID generation function
+ * @param {Function} [options.sessionId.get] Callback function for extracting the session ID from a request
+ * @param {Function} [options.sessionId.set] Callback function for adding the session ID to a response
  * @param {Object} [options.store=MemoryStore] Session store
  * @param {String} [options.unset]
  * @return {Function} middleware
@@ -89,9 +93,6 @@ function session(options) {
 
   // get the cookie options
   var cookieOptions = opts.cookie || {}
-
-  // get the session id generate function
-  var generateId = opts.genid || generateSessionId
 
   // get the session cookie name
   var name = opts.name || opts.key || 'connect.sid'
@@ -114,8 +115,22 @@ function session(options) {
   // get the cookie signing secret
   var secret = opts.secret
 
-  if (typeof generateId !== 'function') {
-    throw new TypeError('genid option must be a function');
+  // get the session ID store
+  var sessionId = getSessionIdStore(opts.sessionId)
+
+  if ('genid' in opts) {
+    sessionId.generate = opts.genid
+    deprecate('"genid" is deprecated; use sessionId.generate instead')
+  }
+
+  if (typeof sessionId.generate !== 'function') {
+    throw new TypeError('"' + (('genid' in opts) ? 'genid' : 'sessionId.generate') + '" option must be a function');
+  }
+  if (typeof sessionId.get !== 'function') {
+    throw new TypeError('"sessionId.get" option must be a function')
+  }
+  if (typeof sessionId.set !== 'function') {
+    throw new TypeError('"sessionId.set" option must be a function')
   }
 
   if (resaveSession === undefined) {
@@ -156,7 +171,7 @@ function session(options) {
 
   // generates the new session
   store.generate = function(req){
-    req.sessionID = generateId(req);
+    req.sessionID = sessionId.generate(req);
     req.session = new Session(req);
     req.session.cookie = new Cookie(cookieOptions);
 
@@ -191,10 +206,6 @@ function session(options) {
       return
     }
 
-    // pathname mismatch
-    var originalPath = parseUrl.original(req).pathname || '/'
-    if (originalPath.indexOf(cookieOptions.path || '/') !== 0) return next();
-
     // ensure a secret is available or bail
     if (!secret && !req.secret) {
       next(new Error('secret option required for sessions'));
@@ -212,24 +223,11 @@ function session(options) {
 
     // expose store
     req.sessionStore = store;
+    var currentSessionID = req.sessionID = sessionId.get(req, name, secrets);
 
-    // get the session ID from the cookie
-    var cookieId = req.sessionID = getcookie(req, name, secrets);
-
-    // set-cookie
     onHeaders(res, function(){
       if (!req.session) {
         debug('no session');
-        return;
-      }
-
-      if (!shouldSetCookie(req)) {
-        return;
-      }
-
-      // only send secure cookies via https
-      if (req.session.cookie.secure && !issecure(req, trustProxy)) {
-        debug('not secured');
         return;
       }
 
@@ -239,8 +237,18 @@ function session(options) {
         touched = true
       }
 
-      // set cookie
-      setcookie(res, name, req.sessionID, secrets[0], req.session.cookie.data);
+      var shouldSetCookie = currentSessionID != req.sessionID
+      ? saveUninitializedSession || isModified(req.session)
+      : rollingSessions || req.session.cookie.expires != null && isModified(req.session)
+
+      var originalPath = parseUrl.original(req).pathname || '/'
+      shouldSetCookie = shouldSetCookie && originalPath.indexOf(cookieOptions.path || '/') === 0
+
+      sessionId.set(res, name, req.sessionID, secrets[0], {
+        cookie: req.session.cookie,
+        secureConnection: issecure(req, trustProxy),
+        shouldSetCookie: shouldSetCookie
+      });
     });
 
     // proxy end() to commit the session
@@ -414,13 +422,12 @@ function session(options) {
 
     // determine if session should be saved to store
     function shouldSave(req) {
-      // cannot set cookie without a session ID
       if (typeof req.sessionID !== 'string') {
         debug('session ignored because of bogus req.sessionID %o', req.sessionID);
         return false;
       }
 
-      return !saveUninitializedSession && cookieId !== req.sessionID
+      return !saveUninitializedSession && currentSessionID !== req.sessionID
         ? isModified(req.session)
         : !isSaved(req.session)
     }
@@ -433,19 +440,7 @@ function session(options) {
         return false;
       }
 
-      return cookieId === req.sessionID && !shouldSave(req);
-    }
-
-    // determine if cookie should be set on response
-    function shouldSetCookie(req) {
-      // cannot set cookie without a session ID
-      if (typeof req.sessionID !== 'string') {
-        return false;
-      }
-
-      return cookieId != req.sessionID
-        ? saveUninitializedSession || isModified(req.session)
-        : rollingSessions || req.session.cookie.expires != null && isModified(req.session);
+      return currentSessionID === req.sessionID && !shouldSave(req);
     }
 
     // generate a session if the browser doesn't send a sessionID
@@ -511,28 +506,30 @@ function generateSessionId(sess) {
  */
 
 function getcookie(req, name, secrets) {
-  var header = req.headers.cookie;
-  var raw;
-  var val;
-
-  // read from cookie header
-  if (header) {
-    var cookies = cookie.parse(header);
-
-    raw = cookies[name];
-
+  function parseRaw(raw) {
+    var ret;
     if (raw) {
       if (raw.substr(0, 2) === 's:') {
-        val = unsigncookie(raw.slice(2), secrets);
+        ret = unsigncookie(raw.slice(2), secrets);
 
-        if (val === false) {
+        if (ret === false) {
           debug('cookie signature invalid');
-          val = undefined;
+          ret = undefined;
         }
       } else {
         debug('cookie unsigned')
       }
     }
+    return ret;
+  }
+
+  var val;
+
+  // read from cookie header
+  var header = req.headers.cookie;
+  if (header) {
+    var cookies = cookie.parse(header);
+    val = parseRaw(cookies[name]);
   }
 
   // back-compat read from cookieParser() signedCookies data
@@ -546,23 +543,10 @@ function getcookie(req, name, secrets) {
 
   // back-compat read from cookieParser() cookies data
   if (!val && req.cookies) {
-    raw = req.cookies[name];
+    val = parseRaw(req.cookies[name]);
 
-    if (raw) {
-      if (raw.substr(0, 2) === 's:') {
-        val = unsigncookie(raw.slice(2), secrets);
-
-        if (val) {
-          deprecate('cookie should be available in req.headers.cookie');
-        }
-
-        if (val === false) {
-          debug('cookie signature invalid');
-          val = undefined;
-        }
-      } else {
-        debug('cookie unsigned')
-      }
+    if (val) {
+      deprecate('cookie should be available in req.headers.cookie');
     }
   }
 
@@ -637,8 +621,18 @@ function issecure(req, trustProxy) {
  */
 
 function setcookie(res, name, val, secret, options) {
+  // ensure that secure cookies are sent via https
+  if (options.cookie.secure && !options.secureConnection) {
+    debug('not secured');
+    return;
+  }
+
+  if (typeof val !== 'string' || !options.shouldSetCookie) {
+    return;
+  }
+
   var signed = 's:' + signature.sign(val, secret);
-  var data = cookie.serialize(name, signed, options);
+  var data = cookie.serialize(name, signed, options.cookie.data);
 
   debug('set-cookie %s', data);
 
@@ -666,4 +660,21 @@ function unsigncookie(val, secrets) {
   }
 
   return false;
+}
+
+/**
+ * Creates session ID store
+ *
+ * @param {Object} sessionId
+ * @returns {Object}
+ * @private
+ */
+function getSessionIdStore(sessionId) {
+  sessionId = sessionId || {};
+
+  return {
+    generate: sessionId.generate || generateSessionId,
+    get: sessionId.get || getcookie,
+    set: sessionId.set || setcookie
+  }
 }

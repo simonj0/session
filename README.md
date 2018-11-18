@@ -161,16 +161,18 @@ as once the cookie is set on HTTPS, it will no longer be visible over HTTP. This
 is useful when the Express `"trust proxy"` setting is properly setup to simplify
 development vs production configuration.
 
-##### genid
+##### genid **(DEPRECATED)**
 
-Function to call to generate a new session ID. Provide a function that returns
+Deprecated, use `sessionId.generate` instead.
+
+~~Function to call to generate a new session ID. Provide a function that returns
 a string that will be used as a session ID. The function is given `req` as the
 first argument if you want to use some value attached to `req` when generating
-the ID.
+the ID.~~
 
-The default value is a function which uses the `uid-safe` library to generate IDs.
+~~The default value is a function which uses the `uid-safe` library to generate IDs.~~
 
-**NOTE** be careful to generate unique IDs so your sessions do not conflict.
+~~**NOTE** be careful to generate unique IDs so your sessions do not conflict.~~
 
 ```js
 app.use(session({
@@ -263,6 +265,28 @@ This is the secret used to sign the session ID cookie. This can be either a stri
 for a single secret, or an array of multiple secrets. If an array of secrets is
 provided, only the first element will be used to sign the session ID cookie, while
 all the elements will be considered when verifying the signature in requests.
+
+##### sessionId
+
+Object which allows to read, set and generate the session ID manually. All 3 methods are optional.
+Defaults to cookie-based sessions.
+```js
+app.use(session({
+  secret: 'my secret',
+  sessionId: {
+    generate: function(req) {
+      return 'sess:' + req.user.id;
+    },
+    get: function(req, name, secrets) {
+      return req.headers['x-api-id'];
+    },
+    set: function(res, name, val, secret) {
+      res.setHeader('x-api-id', val);
+    }
+  }
+}));
+```
+ **NOTE** be careful to generate unique IDs so your sessions do not conflict.
 
 ##### store
 
